@@ -7,7 +7,8 @@ import requests
 
 # Default config for Discovery class
 _config={
-  'default_discovery':'mesos_dns'     # Default discovery system
+  'default_discovery':'mesos_dns',    # Default discovery system
+  'version':'0.7'
 }
 
 # Discoveries objects
@@ -16,7 +17,14 @@ _discoveries={}
 #Logger
 logger=Logger()
 
-class DiscoveryTemplate:
+class DiscoveryTestingTemplate:
+    def do_query_a(fqdn):
+    return ['10.0.0.1','10.0.0.2']
+
+    def do_query_srv(fqdn):
+    return [{'name':'testing.host','port':3333}]
+
+class DiscoveryTemplate(DiscoveryTestingTemplate):
     # Default config values for discovery template
     _config={}
     _defconfig={'enabled':False}
@@ -53,6 +61,37 @@ class DiscoveryTemplate:
             logger.error('Group is not defined in config, SUROK_DISCOVERY_GROUP and MARATHON_APP_ID')
             logger.error('Not in Mesos launch?')
             sys.exit(2)
+    # Do DNS queries
+    # Return array:
+    # ["10.10.10.1", "10.10.10.2"]
+    def do_query_a(fqdn):
+        servers = []
+        try:
+            resolver = dns.resolver.Resolver()
+            for a_rdata in resolver.query(fqdn, 'A'):
+                servers.append(a_rdata.address)
+        except DNSException as e:
+            logger.error("Could not resolve "+fqdn)
+
+        return servers
+
+    # Do DNS queries
+    # Return array:
+    # [{"name": "f.q.d.n", "port": 8876, "ip": ["10.10.10.1", "10.10.10.2"]}]
+    def do_query_srv(fqdn):
+        servers = []
+        try:
+            resolver = dns.resolver.Resolver()
+            resolver.lifetime = 1
+            resolver.timeout = 1
+            query = resolver.query(fqdn, 'SRV')
+            for rdata in query:
+                info = str(rdata).split()
+                servers.append({'name': info[3][:-1], 'port': info[2]})
+        except DNSException as e:
+            logger.error("Could not resolve " + fqdn)
+
+        return servers
 
 
 class Discovery:
@@ -86,6 +125,13 @@ class Discovery:
             else:
                 logger.error('Default discovery "'+discovery+'" is not present')
                 logger.debug('Conf=',conf)
+        if conf.get('version'):
+            version=conf.get('version')
+            if discovery in ['0.7','0.8']:
+                _config['version']=version
+            else:
+                logger.error('Version "'+version+'" unknown')
+                logger.debug('Conf=',conf)
 
     def resolve(self,app):
         __discovery=_config.get('default_discovery')
@@ -98,7 +144,7 @@ class Discovery:
                 logger.debug('App=',app)
                 return {}
         if _discoveries[__discovery].enabled():
-            return _discoveries[__discovery].resolve(app)
+            return self.compatible(_discoveries[__discovery].resolve(app))
         else:
             logger.error('Discovery "'+__discovery+'" is disabled')
         return {}
@@ -108,6 +154,28 @@ class Discovery:
         for d in list(_discoveries.keys()):
             if _discoveries[d].enabled():
                 _discoveries[d].update_data()
+
+    def compatible(self,hosts):
+        __hosts={}
+        if _config['version'] == '0.7':
+            for service in hosts.keys():
+                for host in hosts[service]:
+                    ports=host.get('tcp',[])
+                    if type(ports).__name__ == 'list':
+                        __hosts[service]=[]
+                        for port in ports:
+                            __hosts[service].append({'name':host['name'],
+                                                     'ip':host['ip'],
+                                                     'port':str(port)})
+                    else:
+                        __hosts[service]={}
+                        for port in ports.keys():
+                            __host=__hosts[service].setdefault(port,[])
+                            __host.append({'name':host['name'],
+                                           'ip':host['ip'],
+                                           'port':ports[port]})
+
+        return(__hosts)
 
 
 class DiscoveryMesos(DiscoveryTemplate):
@@ -137,21 +205,25 @@ class DiscoveryMesos(DiscoveryTemplate):
             name = service['name']
             hosts[name] = {}
             serv = hosts[name]
-            if ports is not None:
-                hosts[name] = {}
-                serv = hosts[name]
-                for prot in ['tcp','udp']:
+            for prot in ['tcp','udp']:
+                if ports is not None:
                     for port_name in ports:
-                        for d in do_query('_'+port_name+'._'+name+'.'+group+'._'+prot+'.'+domain):
+                        for d in self.do_query_srv('_'+port_name+'._'+name+'.'+group+'._'+prot+'.'+domain):
                             hostname=d['name']
                             if serv.get(hostname) is None:
-                                serv[hostname]={"name":hostname,"ip":d['ip']}
+                                serv[hostname]={"name":hostname, 'ip':self.do_query_a(hostname)}
                             if serv[hostname].get(prot) is None:
                                 serv[hostname][prot]={}
                                 serv[hostname][prot][port_name]=d['port']
-                hosts[name]=list(hosts[name].values())
-            else:
-                hosts[name]=do_query('_'+name+'.'+group+'._tcp.'+domain)
+                    hosts[name]=list(hosts[name].values())
+                else:
+                    for d in self.do_query_srv('_'+name+'.'+group+'._'+prot+'.'+domain):
+                        hostname=d['name']
+                        if serv.get(hostname) is None:
+                            serv[hostname]={"name":hostname, 'ip':self.do_query_a(hostname)}
+                        if serv[hostname].get(prot) is None:
+                            serv[hostname][prot]=[]
+                        serv[hostname][prot].extend([d['port']])
 
         return hosts
 
@@ -201,31 +273,30 @@ class DiscoveryMarathon(DiscoveryTemplate):
             for task in self.__tasks:
                 if (mask.endswith('*') and task['appId'].startswith(mask[:-1])) or task['appId'] == mask:
                     name='.'.join(task['appId'][len(group):].split('/')[::-1])
-                    if 'ports' in serv:
-                        hosts[name]={}
-                        for port in self.__ports[task['appId']]:
+                    hosts[name]={}
+                    for port in self.__ports[task['appId']]:
+                        if 'ports' in serv:
                             for pp in serv['ports']:
                                 if (pp.endswith('*') and port['name'].startswith(pp[:-1])) or port['name'] == pp:
                                     if hosts[name].get(task['host']) is None:
                                         hosts[name][task['host']]={'name':task['host'],
-                                                                   'ip':do_query_a(task['host'])}
+                                                                   'ip':self.do_query_a(task['host'])}
                                     if hosts[name][task['host']].get(port['protocol']) is None:
                                         hosts[name][task['host']][port['protocol']]={}
                                     hosts[name][task['host']][port['protocol']][port['name']]=task['ports'][task['servicePorts'].index(port['servicePort'])]
-                        hosts[name]=list(hosts[name].values())
-                    else:
-                        hosts[name]=[]
-                        for port in self.__ports[task['appId']]:
-                            hosts[name].append({'name':task['host'],
-                                                'port':task['ports'][task['servicePorts'].index(port['servicePort'])],
-                                                'ip':do_query_a(task['host'])})
+                        else:
+                            if hosts[name].get(task['host']) is None:
+                                hosts[name][task['host']]={'name':task['host'],
+                                                           'ip':self.do_query_a(task['host'])}
+                            if hosts[name][task['host']].get(port['protocol']) is None:
+                                hosts[name][task['host']][port['protocol']]=[]
+                            hosts[name][task['host']][port['protocol']].extend([task['ports'][task['servicePorts'].index(port['servicePort'])]])
+                    hosts[name]=list(hosts[name].values())
 
         return hosts
 
-
 class DiscoveryConsul(DiscoveryTemplate):
     _config={
-                'enabled':False,
                 'domain':None
             }
     def set_config(self,conf):
@@ -242,41 +313,14 @@ class DiscoveryConsul(DiscoveryTemplate):
         domain = self._config['domain']
         for service in services:
             name = service['name']
-            hosts[name]=do_query('_'+name+'._tcp.'+domain)
+            for prot in ['tcp','udp']:
+                for d in self.do_query_srv('_'+name+'._tcp.'+domain):
+                    hostname=d['name']
+                    if serv.get(hostname) is None:
+                         serv[hostname]={"name":hostname, 'ip':self.do_query_a(hostname)}
+                    if serv[hostname].get(prot) is None:
+                         serv[hostname][prot]=[]
+                    serv[hostname][prot].extend([d['port']])
+        hosts[name]=list(hosts[name].values())
         return hosts
 
-
-# Do DNS queries
-# Return array:
-# ["10.10.10.1", "10.10.10.2"]
-def do_query_a(fqdn):
-    servers = []
-    try:
-        resolver = dns.resolver.Resolver()
-        for a_rdata in resolver.query(fqdn, 'A'):
-            servers.append(a_rdata.address)
-    except DNSException as e:
-        logger.error("Could not resolve "+fqdn)
-
-    return servers
-
-
-# Do DNS queries
-# Return array:
-# [{"name": "f.q.d.n", "port": 8876, "ip": ["10.10.10.1", "10.10.10.2"]}]
-def do_query(fqdn):
-    servers = []
-    try:
-        resolver = dns.resolver.Resolver()
-        resolver.lifetime = 1
-        resolver.timeout = 1
-        query = resolver.query(fqdn, 'SRV')
-        for rdata in query:
-            info = str(rdata).split()
-            name = info[3][:-1]
-            port = info[2]
-            servers.append({'name': name, 'port': port, 'ip': do_query_a(name)})
-    except DNSException as e:
-        logger.error("Could not resolve " + fqdn)
-
-    return servers

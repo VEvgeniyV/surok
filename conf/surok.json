@@ -1,4 +1,5 @@
 {
+    "version":"0.8",
     "marathon": {
         "enabled": false,
         "restart": false,
